@@ -37,6 +37,13 @@ pub fn sanity_checks() -> Result<()> {
         }
     }
 
+    // On aarch64, unprivileged PMCCNTR reads must be disabled
+    if let Ok(perf_user_access) = std::fs::read_to_string("/proc/sys/kernel/perf_user_access") {
+        if perf_user_access != "0\n" {
+            bail!("perf_user_access is not set to 0, unable to continue safely");
+        }
+    }
+
     Ok(())
 }
 
@@ -167,7 +174,7 @@ pub fn create_dev_copy() -> Result<()> {
         } else if metadata.is_dir() {
             std::fs::create_dir(&target).with_context(|| format!("Failed to mkdir {target:?}"))?;
         } else {
-            std::fs::File::create(&target)
+            std::fs::File::create_new(&target)
                 .with_context(|| format!("Failed to touch {target:?}"))?;
         }
         system::bind_mount(&source, &target)

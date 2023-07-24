@@ -124,6 +124,9 @@ class Box:
     def reset(self):
         return self.cmd("reset")
 
+    def commit(self):
+        return self.cmd("commit")
+
     def run(
         self,
         argv: list[str],
@@ -154,6 +157,7 @@ class Box:
 class Test(abc.ABC):
     slug: str
     description: str
+    arch: list[str]
 
     def prepare(self, tester):
         pass
@@ -186,6 +190,7 @@ class SimpleTest(Test):
         self,
         slug: str,
         description: str,
+        arch: Optional[list[str]] = None,
         runs: int = 1,
         pass_run_number: bool = False,
         assets: dict[str, str] = {},
@@ -201,6 +206,7 @@ class SimpleTest(Test):
     ):
         self.slug = slug
         self.description = description
+        self.arch = arch
         self.runs = runs
         self.pass_run_number = pass_run_number
         self.assets = assets
@@ -214,6 +220,7 @@ class SimpleTest(Test):
         self.expect = expect
         self.limits = limits
         self.root_dir = None
+        self.files_committed = False
 
     def prepare(self, tester):
         if self.root is not None:
@@ -260,6 +267,7 @@ class SimpleTest(Test):
                     stdin = "/space/stdin.txt"
                     box.mkfile(f"/space/stdin.txt", self.input.encode())
 
+                should_commit = False
                 for cmd in self.preexec:
                     args = cmd.split()
                     if args[0].startswith("~"):
@@ -286,6 +294,8 @@ class SimpleTest(Test):
                             source = os.path.abspath(
                                 self.assets_dir + "/" + source[1:])
                         box.bind(source, target, readonly=readonly)
+                    elif cmd == "commit":
+                        should_commit = True
                     else:
                         raise ValueError(f"Unknown command {cmd}")
 
@@ -383,6 +393,10 @@ class SimpleTest(Test):
                         l, r = parse_approximate_value(expected_value, parser)
                         assert l <= value <= r, f"Expected {key}: {expected_value}, actual: {value}\n\nstdout:\n{stdout}\nstderr:\n{stderr}"
 
+                if should_commit:
+                    box.commit()
+                    self.files_committed = True
+
 
 class CTest(SimpleTest):
     def prepare(self, tester):
@@ -400,23 +414,26 @@ class CTest(SimpleTest):
         super().prepare(tester)
 
     def _bind_and_run(self, box, argv: list[str], **kwargs):
-        box.mkfile(f"/space/{self.slug}")
-        box.bind(os.path.abspath(
-            f"build/{self.slug}"), f"/space/{self.slug}", readonly=True)
+        if not self.files_committed:
+            box.mkfile(f"/space/{self.slug}")
+            box.bind(os.path.abspath(
+                f"build/{self.slug}"), f"/space/{self.slug}", readonly=True)
         return box.run([f"/space/{self.slug}"] + argv, **kwargs)
 
 
 class PyTest(SimpleTest):
     def _bind_and_run(self, box, argv: list[str], **kwargs):
-        box.mkfile(f"/space/{self.slug}.py")
-        box.bind(os.path.abspath(
-            f"tests/{self.slug}.py"), f"/space/{self.slug}.py", readonly=True)
+        if not self.files_committed:
+            box.mkfile(f"/space/{self.slug}.py")
+            box.bind(os.path.abspath(
+                f"tests/{self.slug}.py"), f"/space/{self.slug}.py", readonly=True)
         return box.run(["/usr/bin/python3", f"/space/{self.slug}.py"] + argv, **kwargs)
 
 
 class Tester:
-    def __init__(self, f_makefile: io.TextIOBase):
+    def __init__(self, f_makefile: io.TextIOBase, arch: str):
         self.f_makefile = f_makefile
+        self.arch = arch
         self.make_targets: list[str] = []
         self.tests: list[Test] = []
 
@@ -441,6 +458,8 @@ class Tester:
 
     def prepare(self):
         for test in self.tests:
+            if test.arch is not None and self.arch not in test.arch:
+                continue
             test.prepare(self)
 
         self.f_makefile.write(f"all: " + " ".join(self.make_targets))
@@ -450,10 +469,16 @@ class Tester:
 
     def run(self):
         passes = 0
+        skips = 0
         failures = 0
         crashes = 0
 
         for test in self.tests:
+            if test.arch is not None and self.arch not in test.arch:
+                skips += 1
+                print(f"     \x1b[93mSKIP\x1b[0m [{test.slug}]", flush=True)
+                continue
+
             print(f"          [{test.slug}]", end="", flush=True)
 
             buf_stdout = io.StringIO()
@@ -492,7 +517,6 @@ class Tester:
                 print("\x1b[32m OK\x1b[0m")
                 passes += 1
 
-        total = passes + failures + crashes
         print("  ".join(
             pattern
             .replace("{}", str(cnt))
@@ -500,12 +524,13 @@ class Tester:
             for pattern, cnt in
             [
                 ("\x1b[32m{} test{s} passed\x1b[0m", passes),
+                ("\x1b[93m{} test{s} skipped\x1b[0m", skips),
                 ("\x1b[91m{} test{s} failed\x1b[0m", failures),
                 ("\x1b[95m{} test{s} crashed\x1b[0m", crashes)
             ]
             if cnt > 0
         ))
-        if passes < total:
+        if failures > 0 or crashes > 0:
             raise SystemExit(1)
 
 
@@ -523,7 +548,19 @@ def main():
                    "--core", str(CORE)], check=True)
 
     try:
-        tester = Tester(f_makefile)
+        tester = Tester(f_makefile, sys.argv[1])
+
+        # with Box() as box:
+            # box.commit()
+            # for _ in range(1000):
+                # box.reset()
+                # box.run(["/usr/bin/python3", "-c", ""])
+        # box.mkfile("/space/cat")
+        # box.mkfile("/space/stdin", b"Hello, world!")
+        # box.bind("/usr/bin/cat", "/space/cat", readonly=True)
+        # box.run(["/space/cat"], stdin="/space/stdin",
+        #         stdout="/space/stdout")
+        # box.cat("/space/stdout")
 
         for test_file in sorted(os.listdir("tests")):
             if test_file.endswith(".c"):
